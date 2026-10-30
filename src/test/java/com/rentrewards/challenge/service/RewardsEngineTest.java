@@ -99,6 +99,27 @@ class RewardsEngineTest {
         assertEquals(100_000, member.getPointsForMonth(YearMonth.of(2026, 3)));
     }
 
+    /**
+     * Verifies that even when an event results in CAPPED (0 points awarded),
+     * its eventId is still recorded as processed so a subsequent retry returns DUPLICATE.
+     */
+    @Test
+    void reportsDuplicateWhenACappedEventIsResent() {
+        MemberAccount member = new MemberAccount("member-1", 0);
+        PaymentEvent first = new PaymentEvent("evt-1", "member-1",
+                new BigDecimal("100000"), false, LocalDate.of(2026, 3, 1));
+        PaymentEvent cappedEvent = new PaymentEvent("evt-2", "member-1",
+                new BigDecimal("500"), false, LocalDate.of(2026, 3, 2));
+
+        engine.processPayment(first, member);
+        PointsResult firstCappedAttempt = engine.processPayment(cappedEvent, member);
+        PointsResult retryCappedAttempt = engine.processPayment(cappedEvent, member);
+
+        assertEquals(ProcessingOutcome.CAPPED, firstCappedAttempt.getOutcome());
+        assertEquals(ProcessingOutcome.DUPLICATE, retryCappedAttempt.getOutcome());
+        assertTrue(retryCappedAttempt.isSkippedAsDuplicate());
+    }
+
     @Test
     void doesNotDoubleAwardPointsWhenSameWebhookEventIsResent() {
         MemberAccount member = new MemberAccount("member-1", 0);
@@ -174,6 +195,52 @@ class RewardsEngineTest {
             assertEquals(1, awardedResults,
                     "at most one worker may award points for the same eventId");
             assertEquals(1500, member.getPointsForMonth(YearMonth.of(2026, 3)));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    /**
+     * Verifies that multiple distinct events processed in parallel for the same member
+     * strictly respect the 100,000 monthly points cap via member synchronization.
+     */
+    @RepeatedTest(8)
+    void enforcesMonthlyPointsCapWhenDistinctEventsArriveConcurrently() throws Exception {
+        int workerCount = 16;
+        RewardsEngine concurrentEngine = new RewardsEngine(
+                new PointsCalculator(), new ProcessedEventStore());
+        MemberAccount member = new MemberAccount("member-1", 0);
+        ExecutorService executor = Executors.newFixedThreadPool(workerCount);
+        CountDownLatch ready = new CountDownLatch(workerCount);
+        CountDownLatch start = new CountDownLatch(1);
+
+        try {
+            List<Future<PointsResult>> futures = new ArrayList<>();
+            for (int worker = 0; worker < workerCount; worker++) {
+                final String eventId = "evt-cap-" + worker;
+                PaymentEvent event = new PaymentEvent(
+                        eventId,
+                        "member-1",
+                        new BigDecimal("25000"),
+                        false,
+                        LocalDate.of(2026, 3, 1));
+                futures.add(executor.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return concurrentEngine.processPayment(event, member);
+                }));
+            }
+
+            assertTrue(ready.await(2, TimeUnit.SECONDS));
+            start.countDown();
+
+            long totalAwardedFromResults = 0;
+            for (Future<PointsResult> future : futures) {
+                totalAwardedFromResults += future.get(2, TimeUnit.SECONDS).getPointsAwarded();
+            }
+
+            assertEquals(100_000, totalAwardedFromResults);
+            assertEquals(100_000, member.getPointsForMonth(YearMonth.of(2026, 3)));
         } finally {
             executor.shutdownNow();
         }
